@@ -1,0 +1,9 @@
+.env
+.streamlit/secrets.toml
+chroma_db/
+data/
+__pycache__/
+*.pyc
+.DS_Store
+*.ipynb
+*.ipynb_checkpoints
