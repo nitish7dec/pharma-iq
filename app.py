@@ -38,6 +38,14 @@ BASE_LAYOUT = dict(
     font=dict(family="Plus Jakarta Sans, sans-serif", color="#374151"),
 )
 
+# Financial keywords for boosting
+FINANCIAL_KEYWORDS = [
+    "revenue", "income", "expense", "profit", "loss", "cost",
+    "r&d", "research", "development", "margin", "earnings",
+    "billion", "million", "sales", "gross", "net", "operating",
+    "ebitda", "cash", "debt", "equity", "dividend", "eps"
+]
+
 SYSTEM_PROMPT = """You are an expert pharmaceutical industry analyst with deep knowledge
 of financial reporting, clinical trials, and regulatory filings.
 
@@ -47,28 +55,27 @@ You have access to:
 - Pfizer Clinical Trials: 803 trials (ClinicalTrials.gov)
 - Eli Lilly Clinical Trials: 775 trials (ClinicalTrials.gov)
 
-You are a dynamic assistant. You must automatically:
-- Detect which company the user is asking about
-- Detect which year they are referring to
-- Detect whether they want financial data or clinical trial data
-- Compare across companies or years if asked
+You must automatically detect:
+- Which company the user is asking about
+- Which year they are referring to
+- Whether they want financial data or clinical trial data
+- If comparison across companies or years is needed
 
-Rules you must STRICTLY follow:
-1. Answer ONLY from the provided context. Never use general knowledge or training data.
-2. Always cite every fact: (Source: Company | Doc Type | Year | Page X)
-3. If context is insufficient say exactly:
-   "I don't have sufficient data in the provided documents to answer this."
+STRICT RULES:
+1. Answer ONLY from the provided context. Never use training knowledge.
+2. Cite EVERY fact: (Source: Company | Doc Type | Year | Page X)
+3. If context is insufficient: "I don't have sufficient data in the provided documents."
 4. For ALL numbers be precise — always include units (millions, billions, %).
 5. For multi-company questions ALWAYS use structured headings for each company.
-6. Never fabricate, estimate, or guess any data, statistics, or trial results.
-7. If a company or year is not in your data say:
-   "I only have data for Pfizer (2023, 2024) and Eli Lilly (2023, 2025)."
-8. If you find partial data, clearly state what you found and what is missing.
-9. Never say a figure is unavailable if it appears anywhere in the context.
-10. For comparison questions — always attempt to answer for BOTH companies.
-    If one is missing, state clearly which company's data was not retrieved.
-11. Structure your answers with clear headings, bullet points and tables where appropriate.
-12. Always end comparison answers with a brief Summary section.
+6. Never fabricate, estimate, or guess any data or statistics.
+7. If company/year not in data: "I only have data for Pfizer (2023,2024) and Eli Lilly (2023,2025)."
+8. Always look for TOTAL figures first — not just partial line items.
+9. If you only find partial figures, clearly say what's partial and what's missing.
+10. For comparison questions — answer for BOTH companies with clear headings.
+11. Structure answers with headings, bullet points and tables where appropriate.
+12. End comparison answers with a brief Summary section.
+13. For financial questions — prioritize Income Statement and Summary table data.
+14. If data seems incomplete, tell user to ask more specifically.
 """
 
 # ══════════════════════════════════════════════════
@@ -147,106 +154,206 @@ def load_pinecone():
     return pc.Index(PINECONE_INDEX)
 
 # ══════════════════════════════════════════════════
-# QUERY PIPELINE — Best Retrieval Strategy
+# IMPROVEMENT 1 — Multi Query Generator
 # ══════════════════════════════════════════════════
-def rewrite_query(q):
-    """Fix typos and rephrase for better retrieval"""
+def generate_queries(question):
+    """
+    Generate multiple search variations of the question.
+    This dramatically improves retrieval by casting a wider net.
+    """
     c = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     m = c.messages.create(
         model      = CLAUDE_MODEL,
-        max_tokens = 80,
-        messages   = [{"role":"user","content":f"""Fix any typos and rewrite this question clearly for document search.
-Return ONLY the rewritten question, nothing else.
-Question: {q}"""}]
+        max_tokens = 200,
+        messages   = [{"role":"user","content":f"""You are a search query generator for pharmaceutical documents.
+
+Generate 4 different search queries to find information about this question.
+Each query should use different keywords but target the same information.
+Focus on financial statement terms, annual report language, and clinical trial terminology.
+
+Question: {question}
+
+Return ONLY 4 queries, one per line, no numbering, no explanation."""}]
     )
-    return m.content[0].text.strip()
+    queries = [q.strip() for q in m.content[0].text.strip().split("\n") if q.strip()][:4]
+    queries.insert(0, question)  # always include original
+    return queries
 
 
-def query_pinecone(index, qvec, company, doc_type, top_k):
-    """Query Pinecone with company + doc_type filter"""
+# ══════════════════════════════════════════════════
+# IMPROVEMENT 2 — Financial Keyword Detection
+# ══════════════════════════════════════════════════
+def is_financial_question(question):
+    """Detect if question is about financials"""
+    q_lower = question.lower()
+    return any(kw in q_lower for kw in FINANCIAL_KEYWORDS)
+
+
+# ══════════════════════════════════════════════════
+# IMPROVEMENT 3 — Smart Pinecone Query
+# ══════════════════════════════════════════════════
+def query_pinecone_smart(index, qvec, company, doc_type, top_k, financial_boost=False):
+    """
+    Query Pinecone with optional financial page boosting.
+    For financial questions, first search financial pages then narrative.
+    """
     try:
+        filters = {
+            "$and": [
+                {"company":  {"$eq": company}},
+                {"doc_type": {"$eq": doc_type}},
+            ]
+        }
+
+        # Financial boost — search financial pages first
+        if financial_boost and doc_type == "annual":
+            fin_filter = {
+                "$and": [
+                    {"company":      {"$eq": company}},
+                    {"doc_type":     {"$eq": doc_type}},
+                    {"is_financial": {"$eq": "True"}},
+                ]
+            }
+            fin_res = index.query(
+                vector           = qvec,
+                top_k            = top_k,
+                include_metadata = True,
+                filter           = fin_filter
+            )
+            # Also get some narrative for context
+            nar_res = index.query(
+                vector           = qvec,
+                top_k            = 3,
+                include_metadata = True,
+                filter           = filters
+            )
+            return fin_res["matches"] + nar_res["matches"]
+
+        # Standard query
         res = index.query(
             vector           = qvec,
             top_k            = top_k,
             include_metadata = True,
-            filter           = {
-                "$and": [
-                    {"company":  {"$eq": company}},
-                    {"doc_type": {"$eq": doc_type}},
-                ]
-            }
+            filter           = filters
         )
         return res["matches"]
+
     except Exception as e:
         return []
 
 
+# ══════════════════════════════════════════════════
+# MAIN QUERY PIPELINE — All 5 Improvements
+# ══════════════════════════════════════════════════
 def query_pipeline(user_question):
-    # Step 1 — Fix typos
-    clean = rewrite_query(user_question)
 
-    # Step 2 — Embed
-    model = get_embed_model()
-    qvec  = model.encode(clean, normalize_embeddings=True).tolist()
+    # ── IMPROVEMENT 1: Multi-Query Search ──────────
+    queries    = generate_queries(user_question)
+    is_fin     = is_financial_question(user_question)
+    model      = get_embed_model()
+    index      = load_pinecone()
 
-    # Step 3 — Smart retrieval — equal from BOTH companies
-    index = load_pinecone()
+    # Embed all query variations
+    query_vecs = model.encode(
+        queries,
+        normalize_embeddings = True,
+    ).tolist()
 
-    # 5 annual chunks per company = 10 total annual
-    pfe_annual = query_pinecone(index, qvec, "pfizer",    "annual",   5)
-    lly_annual = query_pinecone(index, qvec, "eli_lilly", "annual",   5)
+    # ── IMPROVEMENT 2 + 3: Smart retrieval ─────────
+    # Collect unique results across all query variations
+    all_results = {}  # id → (text, meta, score)
 
-    # 2 clinical chunks per company = 4 total clinical
-    pfe_clin   = query_pinecone(index, qvec, "pfizer",    "clinical", 2)
-    lly_clin   = query_pinecone(index, qvec, "eli_lilly", "clinical", 2)
+    for qvec in query_vecs:
+        # 8 annual per company with financial boosting
+        for company in ["pfizer", "eli_lilly"]:
+            matches = query_pinecone_smart(
+                index, qvec, company, "annual",
+                top_k          = 8,
+                financial_boost = is_fin
+            )
+            for m in matches:
+                mid = m["id"]
+                score = m["score"]
+                if mid not in all_results or all_results[mid][2] < score:
+                    all_results[mid] = (
+                        m["metadata"].get("text", ""),
+                        m["metadata"],
+                        score
+                    )
 
-    # Combine all 14 chunks
-    all_matches = pfe_annual + lly_annual + pfe_clin + lly_clin
+        # 3 clinical per company
+        for company in ["pfizer", "eli_lilly"]:
+            matches = query_pinecone_smart(
+                index, qvec, company, "clinical",
+                top_k          = 3,
+                financial_boost = False
+            )
+            for m in matches:
+                mid   = m["id"]
+                score = m["score"]
+                if mid not in all_results or all_results[mid][2] < score:
+                    all_results[mid] = (
+                        m["metadata"].get("text", ""),
+                        m["metadata"],
+                        score
+                    )
 
-    results = []
-    for match in all_matches:
-        results.append((
-            match["metadata"].get("text", ""),
-            match["metadata"],
-            1 - match["score"]
-        ))
+    # Sort by best score, take top 20
+    sorted_results = sorted(
+        all_results.values(),
+        key    = lambda x: x[2],
+        reverse = True
+    )[:20]
 
-    # Step 4 — Build rich context
+    results = [(text, meta, 1-score) for text, meta, score in sorted_results]
+
+    # ── Build rich context ──────────────────────────
     context = ""
     for i, (doc, meta, score) in enumerate(results):
         context += f"""
 --- Source {i+1} ---
-Company      : {meta.get('company','').upper()}
-Document Type: {meta.get('doc_type','').title()} Report
-Year         : {meta.get('year','')}
+Company      : {meta.get('company','').upper().replace('_',' ')}
+Document     : {meta.get('doc_type','').title()} Report {meta.get('year','')}
 Page         : {meta.get('page','')}
-Relevance    : {round((1-score)*100, 1)}%
+Financial    : {meta.get('is_financial','false')}
 Content      : {doc}
 """
 
-    # Step 5 — Build prompt
+    # ── Build prompt ────────────────────────────────
     prompt = f"""You have been provided with {len(results)} source excerpts from pharmaceutical documents.
+{'⚠️ This appears to be a FINANCIAL question. Prioritize Income Statement and Summary table data.' if is_fin else ''}
 
 {context}
 
-USER QUESTION: {clean}
+USER QUESTION: {user_question}
 
 Instructions:
-- Answer comprehensively using ALL relevant sources above
-- For comparison questions, provide data for BOTH Pfizer and Eli Lilly
+- Answer comprehensively using ALL relevant sources
+- For comparison questions provide data for BOTH Pfizer AND Eli Lilly
 - Use clear headings for each company
-- Cite every fact with its source
-- End with a brief Summary if comparing companies
-- If data for one company is missing from context, explicitly state this
+- For financial data look for TOTAL figures not partial line items
+- Cite every fact with its source page
+- End with a Summary if comparing companies
+- If data for one company is missing, explicitly state this
 """
 
-    # Step 6 — Call Claude
-    claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg     = claude.messages.create(
+    # ── IMPROVEMENT 4: Better System Prompt ────────
+    # ── IMPROVEMENT 5: Conversation Memory ─────────
+    history = []
+    for msg in st.session_state.messages[-6:]:
+        history.append({
+            "role"   : msg["role"],
+            "content": msg["content"]
+        })
+    history.append({"role": "user", "content": prompt})
+
+    # ── Call Claude ─────────────────────────────────
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg    = claude.messages.create(
         model      = CLAUDE_MODEL,
         max_tokens = MAX_TOKENS,
         system     = SYSTEM_PROMPT,
-        messages   = [{"role":"user","content":prompt}]
+        messages   = history
     )
 
     answer     = msg.content[0].text
@@ -337,161 +444,84 @@ if st.session_state.view == "dashboard":
     with c1:
         st.markdown('<div class="chart-card"><div class="chart-title">Revenue Comparison</div><div class="chart-sub">Total revenue USD millions · across available fiscal years</div>', unsafe_allow_html=True)
         fig = go.Figure()
-        fig.add_trace(go.Bar(name="Pfizer", x=["FY2023","FY2024"], y=[58496,63625],
-            marker_color=PFE_COLOR, text=["$58.5B","$63.6B"],
-            textposition="outside", textfont=dict(size=11,color=PFE_COLOR,family="JetBrains Mono"),width=0.35))
-        fig.add_trace(go.Bar(name="Eli Lilly", x=["FY2023","FY2025"], y=[34124,45042],
-            marker_color=LLY_COLOR, text=["$34.1B","$45.0B"],
-            textposition="outside", textfont=dict(size=11,color=LLY_COLOR,family="JetBrains Mono"),width=0.35))
-        fig.update_layout(**BASE_LAYOUT, height=270, barmode="group",
-            margin=dict(l=0,r=0,t=30,b=0),
-            legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),
-            xaxis=dict(showgrid=False,tickfont=dict(size=11)),
-            yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 <strong>Eli Lilly grew 31.9%</strong> driven by GLP-1 drugs (Mounjaro, Zepbound). Pfizer recovered 8.8% in FY2024 after the post-COVID revenue cliff.</div></div>', unsafe_allow_html=True)
+        fig.add_trace(go.Bar(name="Pfizer",x=["FY2023","FY2024"],y=[58496,63625],marker_color=PFE_COLOR,text=["$58.5B","$63.6B"],textposition="outside",textfont=dict(size=11,color=PFE_COLOR,family="JetBrains Mono"),width=0.35))
+        fig.add_trace(go.Bar(name="Eli Lilly",x=["FY2023","FY2025"],y=[34124,45042],marker_color=LLY_COLOR,text=["$34.1B","$45.0B"],textposition="outside",textfont=dict(size=11,color=LLY_COLOR,family="JetBrains Mono"),width=0.35))
+        fig.update_layout(**BASE_LAYOUT,height=270,barmode="group",margin=dict(l=0,r=0,t=30,b=0),legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),xaxis=dict(showgrid=False,tickfont=dict(size=11)),yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
+        st.plotly_chart(fig,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 <strong>Eli Lilly grew 31.9%</strong> driven by GLP-1 drugs (Mounjaro, Zepbound). Pfizer recovered 8.8% in FY2024 after the post-COVID revenue cliff.</div></div>',unsafe_allow_html=True)
 
     with c2:
-        st.markdown('<div class="chart-card"><div class="chart-title">Financial Health — FY 2023</div><div class="chart-sub">Revenue · Gross Profit · R&D · Net Income in USD millions</div>', unsafe_allow_html=True)
-        fig2 = go.Figure()
-        cats = ["Revenue","Gross Profit","R&D Spend","Net Income"]
-        fig2.add_trace(go.Bar(name="Pfizer", x=cats, y=[58496,40941,10679,2233],
-            marker_color=PFE_COLOR, opacity=0.85,
-            text=["$58.5B","$40.9B","$10.7B","$2.2B"],
-            textposition="outside", textfont=dict(size=10,color=PFE_COLOR,family="JetBrains Mono")))
-        fig2.add_trace(go.Bar(name="Eli Lilly", x=cats, y=[34124,28496,9234,5240],
-            marker_color=LLY_COLOR, opacity=0.85,
-            text=["$34.1B","$28.5B","$9.2B","$5.2B"],
-            textposition="outside", textfont=dict(size=10,color=LLY_COLOR,family="JetBrains Mono")))
-        fig2.update_layout(**BASE_LAYOUT, height=270, barmode="group",
-            margin=dict(l=0,r=0,t=30,b=0),
-            legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),
-            xaxis=dict(showgrid=False,tickfont=dict(size=11)),
-            yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
-        st.plotly_chart(fig2, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 <strong>Eli Lilly net margin (15.4%)</strong> far exceeds Pfizer (3.8%) in FY2023. Despite lower revenue, Eli Lilly converts more revenue to profit.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Financial Health — FY 2023</div><div class="chart-sub">Revenue · Gross Profit · R&D · Net Income in USD millions</div>',unsafe_allow_html=True)
+        fig2=go.Figure()
+        cats=["Revenue","Gross Profit","R&D Spend","Net Income"]
+        fig2.add_trace(go.Bar(name="Pfizer",x=cats,y=[58496,40941,10679,2233],marker_color=PFE_COLOR,opacity=0.85,text=["$58.5B","$40.9B","$10.7B","$2.2B"],textposition="outside",textfont=dict(size=10,color=PFE_COLOR,family="JetBrains Mono")))
+        fig2.add_trace(go.Bar(name="Eli Lilly",x=cats,y=[34124,28496,9234,5240],marker_color=LLY_COLOR,opacity=0.85,text=["$34.1B","$28.5B","$9.2B","$5.2B"],textposition="outside",textfont=dict(size=10,color=LLY_COLOR,family="JetBrains Mono")))
+        fig2.update_layout(**BASE_LAYOUT,height=270,barmode="group",margin=dict(l=0,r=0,t=30,b=0),legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),xaxis=dict(showgrid=False,tickfont=dict(size=11)),yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
+        st.plotly_chart(fig2,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 <strong>Eli Lilly net margin (15.4%)</strong> far exceeds Pfizer (3.8%) in FY2023. Despite lower revenue, Eli Lilly converts more revenue to profit.</div></div>',unsafe_allow_html=True)
 
-    st.markdown('<div class="sec-hdr"><div class="sec-title">🎯 Strategic Positioning</div><div class="sec-badge">Gartner · McKinsey Framework</div></div>', unsafe_allow_html=True)
-    c3,c4 = st.columns(2)
+    st.markdown('<div class="sec-hdr"><div class="sec-title">🎯 Strategic Positioning</div><div class="sec-badge">Gartner · McKinsey Framework</div></div>',unsafe_allow_html=True)
+    c3,c4=st.columns(2)
 
     with c3:
-        st.markdown('<div class="chart-card"><div class="chart-title">Pharma Magic Quadrant</div><div class="chart-sub">Execution strength vs Innovation vision · Gartner-style</div>', unsafe_allow_html=True)
-        fig_mq = go.Figure()
-        for x0,x1,y0,y1,col,lbl in [
-            (0,5,5,10,"rgba(239,246,255,0.5)","VISIONARIES"),
-            (5,10,5,10,"rgba(240,253,244,0.5)","LEADERS"),
-            (0,5,0,5,"rgba(249,250,251,0.5)","NICHE PLAYERS"),
-            (5,10,0,5,"rgba(255,251,235,0.5)","CHALLENGERS"),
-        ]:
+        st.markdown('<div class="chart-card"><div class="chart-title">Pharma Magic Quadrant</div><div class="chart-sub">Execution strength vs Innovation vision · Gartner-style</div>',unsafe_allow_html=True)
+        fig_mq=go.Figure()
+        for x0,x1,y0,y1,col,lbl in [(0,5,5,10,"rgba(239,246,255,0.5)","VISIONARIES"),(5,10,5,10,"rgba(240,253,244,0.5)","LEADERS"),(0,5,0,5,"rgba(249,250,251,0.5)","NICHE PLAYERS"),(5,10,0,5,"rgba(255,251,235,0.5)","CHALLENGERS")]:
             fig_mq.add_shape(type="rect",x0=x0,x1=x1,y0=y0,y1=y1,fillcolor=col,line=dict(width=0),layer="below")
-            fig_mq.add_annotation(x=(x0+x1)/2,y=(y0+y1)/2,text=lbl,
-                font=dict(size=9,color="#C8D5E0",family="Plus Jakarta Sans"),showarrow=False)
+            fig_mq.add_annotation(x=(x0+x1)/2,y=(y0+y1)/2,text=lbl,font=dict(size=9,color="#C8D5E0",family="Plus Jakarta Sans"),showarrow=False)
         fig_mq.add_shape(type="line",x0=5,x1=5,y0=0,y1=10,line=dict(color="#E2E8F0",width=1,dash="dot"))
         fig_mq.add_shape(type="line",x0=0,x1=10,y0=5,y1=5,line=dict(color="#E2E8F0",width=1,dash="dot"))
-        fig_mq.add_trace(go.Scatter(x=[7.1],y=[9.1],mode="markers+text",
-            marker=dict(size=28,color=LLY_COLOR,opacity=0.9,line=dict(color="white",width=2)),
-            text=["Eli Lilly"],textposition="middle center",
-            textfont=dict(color="white",size=10,family="Plus Jakarta Sans"),
-            showlegend=False,hovertemplate="<b>Eli Lilly</b><br>Execution: 7.1/10<br>Vision: 9.1/10<extra></extra>"))
-        fig_mq.add_trace(go.Scatter(x=[8.2],y=[6.8],mode="markers+text",
-            marker=dict(size=28,color=PFE_COLOR,opacity=0.9,line=dict(color="white",width=2)),
-            text=["Pfizer"],textposition="middle center",
-            textfont=dict(color="white",size=10,family="Plus Jakarta Sans"),
-            showlegend=False,hovertemplate="<b>Pfizer</b><br>Execution: 8.2/10<br>Vision: 6.8/10<extra></extra>"))
-        fig_mq.update_layout(**BASE_LAYOUT, height=280, showlegend=False,
-            margin=dict(l=0,r=0,t=30,b=0),
-            xaxis=dict(title="Ability to Execute →",range=[0,10],showgrid=False,zeroline=False,
-                title_font=dict(size=10,color="#64748B"),tickfont=dict(size=9)),
-            yaxis=dict(title="↑ Completeness of Vision",range=[0,10],showgrid=False,zeroline=False,
-                title_font=dict(size=10,color="#64748B"),tickfont=dict(size=9)))
-        st.plotly_chart(fig_mq, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 <strong>Eli Lilly leads on Vision</strong> — R&D intensity 27.1%, GLP-1 dominance, Alzheimer pipeline. <strong>Pfizer leads on Execution</strong> — larger revenue base, global commercial reach.</div></div>', unsafe_allow_html=True)
+        fig_mq.add_trace(go.Scatter(x=[7.1],y=[9.1],mode="markers+text",marker=dict(size=28,color=LLY_COLOR,opacity=0.9,line=dict(color="white",width=2)),text=["Eli Lilly"],textposition="middle center",textfont=dict(color="white",size=10,family="Plus Jakarta Sans"),showlegend=False,hovertemplate="<b>Eli Lilly</b><br>Execution: 7.1/10<br>Vision: 9.1/10<extra></extra>"))
+        fig_mq.add_trace(go.Scatter(x=[8.2],y=[6.8],mode="markers+text",marker=dict(size=28,color=PFE_COLOR,opacity=0.9,line=dict(color="white",width=2)),text=["Pfizer"],textposition="middle center",textfont=dict(color="white",size=10,family="Plus Jakarta Sans"),showlegend=False,hovertemplate="<b>Pfizer</b><br>Execution: 8.2/10<br>Vision: 6.8/10<extra></extra>"))
+        fig_mq.update_layout(**BASE_LAYOUT,height=280,showlegend=False,margin=dict(l=0,r=0,t=30,b=0),xaxis=dict(title="Ability to Execute →",range=[0,10],showgrid=False,zeroline=False,title_font=dict(size=10,color="#64748B"),tickfont=dict(size=9)),yaxis=dict(title="↑ Completeness of Vision",range=[0,10],showgrid=False,zeroline=False,title_font=dict(size=10,color="#64748B"),tickfont=dict(size=9)))
+        st.plotly_chart(fig_mq,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 <strong>Eli Lilly leads on Vision</strong> — R&D intensity 27.1%, GLP-1 dominance, Alzheimer pipeline. <strong>Pfizer leads on Execution</strong> — larger revenue base, global commercial reach.</div></div>',unsafe_allow_html=True)
 
     with c4:
-        st.markdown('<div class="chart-card"><div class="chart-title">Innovation Radar</div><div class="chart-sub">6-dimension strategic comparison</div>', unsafe_allow_html=True)
-        dims  = ["R&D Intensity","Pipeline Depth","Revenue Scale","Profit Margin","Phase 3 Count","Therapeutic Diversity"]
-        pfe_s = [6.5,8.0,9.5,3.5,7.0,8.5]
-        lly_s = [9.0,7.5,6.5,8.0,8.5,7.0]
-        fig_r = go.Figure()
-        fig_r.add_trace(go.Scatterpolar(r=pfe_s+[pfe_s[0]],theta=dims+[dims[0]],fill="toself",
-            name="Pfizer",line=dict(color=PFE_COLOR,width=2),fillcolor="rgba(29,78,216,0.1)",
-            marker=dict(size=5,color=PFE_COLOR)))
-        fig_r.add_trace(go.Scatterpolar(r=lly_s+[lly_s[0]],theta=dims+[dims[0]],fill="toself",
-            name="Eli Lilly",line=dict(color=LLY_COLOR,width=2),fillcolor="rgba(190,18,60,0.08)",
-            marker=dict(size=5,color=LLY_COLOR)))
-        fig_r.update_layout(**BASE_LAYOUT, height=280,
-            margin=dict(l=0,r=0,t=10,b=40),
-            legend=dict(orientation="h",yanchor="bottom",y=-0.18,xanchor="center",x=0.5,font=dict(size=11)),
-            polar=dict(bgcolor="rgba(0,0,0,0)",
-                radialaxis=dict(visible=True,range=[0,10],tickfont=dict(size=8),gridcolor="#E2E8F0",linecolor="#E2E8F0"),
-                angularaxis=dict(tickfont=dict(size=9,family="Plus Jakarta Sans"),gridcolor="#E2E8F0",linecolor="#E2E8F0")))
-        st.plotly_chart(fig_r, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 Eli Lilly dominates <strong>R&D Intensity & Profit Margin</strong>. Pfizer leads on <strong>Revenue Scale & Therapeutic Diversity</strong>.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Innovation Radar</div><div class="chart-sub">6-dimension strategic comparison</div>',unsafe_allow_html=True)
+        dims=["R&D Intensity","Pipeline Depth","Revenue Scale","Profit Margin","Phase 3 Count","Therapeutic Diversity"]
+        pfe_s=[6.5,8.0,9.5,3.5,7.0,8.5]; lly_s=[9.0,7.5,6.5,8.0,8.5,7.0]
+        fig_r=go.Figure()
+        fig_r.add_trace(go.Scatterpolar(r=pfe_s+[pfe_s[0]],theta=dims+[dims[0]],fill="toself",name="Pfizer",line=dict(color=PFE_COLOR,width=2),fillcolor="rgba(29,78,216,0.1)",marker=dict(size=5,color=PFE_COLOR)))
+        fig_r.add_trace(go.Scatterpolar(r=lly_s+[lly_s[0]],theta=dims+[dims[0]],fill="toself",name="Eli Lilly",line=dict(color=LLY_COLOR,width=2),fillcolor="rgba(190,18,60,0.08)",marker=dict(size=5,color=LLY_COLOR)))
+        fig_r.update_layout(**BASE_LAYOUT,height=280,margin=dict(l=0,r=0,t=10,b=40),legend=dict(orientation="h",yanchor="bottom",y=-0.18,xanchor="center",x=0.5,font=dict(size=11)),polar=dict(bgcolor="rgba(0,0,0,0)",radialaxis=dict(visible=True,range=[0,10],tickfont=dict(size=8),gridcolor="#E2E8F0",linecolor="#E2E8F0"),angularaxis=dict(tickfont=dict(size=9,family="Plus Jakarta Sans"),gridcolor="#E2E8F0",linecolor="#E2E8F0")))
+        st.plotly_chart(fig_r,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 Eli Lilly dominates <strong>R&D Intensity & Profit Margin</strong>. Pfizer leads on <strong>Revenue Scale & Therapeutic Diversity</strong>.</div></div>',unsafe_allow_html=True)
 
-    st.markdown('<div class="sec-hdr"><div class="sec-title">🧬 Clinical Trial Intelligence</div><div class="sec-badge">ClinicalTrials.gov · 1,578 Trials</div></div>', unsafe_allow_html=True)
-    c5,c6,c7 = st.columns(3)
+    st.markdown('<div class="sec-hdr"><div class="sec-title">🧬 Clinical Trial Intelligence</div><div class="sec-badge">ClinicalTrials.gov · 1,578 Trials</div></div>',unsafe_allow_html=True)
+    c5,c6,c7=st.columns(3)
 
     with c5:
-        st.markdown('<div class="chart-card"><div class="chart-title">Pfizer · Phase Distribution</div><div class="chart-sub">803 total trials</div>', unsafe_allow_html=True)
-        fig_d1 = go.Figure(go.Pie(
-            labels=["Phase 1","Phase 2","Phase 3","Ph 1/2","Ph 2/3"],
-            values=[434,149,174,29,17], hole=0.60,
-            marker=dict(colors=["#DBEAFE","#93C5FD","#1D4ED8","#BFDBFE","#60A5FA"],line=dict(color="white",width=2)),
-            textinfo="percent+label", textfont=dict(size=9,family="Plus Jakarta Sans"),
-            hovertemplate="<b>%{label}</b><br>%{value} trials<extra></extra>"))
-        fig_d1.add_annotation(text="<b>803</b><br>Trials",x=0.5,y=0.5,
-            font=dict(size=13,color="#0F172A",family="Plus Jakarta Sans"),showarrow=False)
-        fig_d1.update_layout(**BASE_LAYOUT, height=240, showlegend=False, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig_d1, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Pfizer · Phase Distribution</div><div class="chart-sub">803 total trials</div>',unsafe_allow_html=True)
+        fig_d1=go.Figure(go.Pie(labels=["Phase 1","Phase 2","Phase 3","Ph 1/2","Ph 2/3"],values=[434,149,174,29,17],hole=0.60,marker=dict(colors=["#DBEAFE","#93C5FD","#1D4ED8","#BFDBFE","#60A5FA"],line=dict(color="white",width=2)),textinfo="percent+label",textfont=dict(size=9,family="Plus Jakarta Sans"),hovertemplate="<b>%{label}</b><br>%{value} trials<extra></extra>"))
+        fig_d1.add_annotation(text="<b>803</b><br>Trials",x=0.5,y=0.5,font=dict(size=13,color="#0F172A",family="Plus Jakarta Sans"),showarrow=False)
+        fig_d1.update_layout(**BASE_LAYOUT,height=240,showlegend=False,margin=dict(l=0,r=0,t=0,b=0))
+        st.plotly_chart(fig_d1,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('</div>',unsafe_allow_html=True)
 
     with c6:
-        st.markdown('<div class="chart-card"><div class="chart-title">Eli Lilly · Phase Distribution</div><div class="chart-sub">775 total trials</div>', unsafe_allow_html=True)
-        fig_d2 = go.Figure(go.Pie(
-            labels=["Phase 1","Phase 2","Phase 3","Ph 1/2","Ph 2/3"],
-            values=[441,118,197,14,4], hole=0.60,
-            marker=dict(colors=["#FEE2E2","#FCA5A5","#BE123C","#FECDD3","#F87171"],line=dict(color="white",width=2)),
-            textinfo="percent+label", textfont=dict(size=9,family="Plus Jakarta Sans"),
-            hovertemplate="<b>%{label}</b><br>%{value} trials<extra></extra>"))
-        fig_d2.add_annotation(text="<b>775</b><br>Trials",x=0.5,y=0.5,
-            font=dict(size=13,color="#0F172A",family="Plus Jakarta Sans"),showarrow=False)
-        fig_d2.update_layout(**BASE_LAYOUT, height=240, showlegend=False, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig_d2, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Eli Lilly · Phase Distribution</div><div class="chart-sub">775 total trials</div>',unsafe_allow_html=True)
+        fig_d2=go.Figure(go.Pie(labels=["Phase 1","Phase 2","Phase 3","Ph 1/2","Ph 2/3"],values=[441,118,197,14,4],hole=0.60,marker=dict(colors=["#FEE2E2","#FCA5A5","#BE123C","#FECDD3","#F87171"],line=dict(color="white",width=2)),textinfo="percent+label",textfont=dict(size=9,family="Plus Jakarta Sans"),hovertemplate="<b>%{label}</b><br>%{value} trials<extra></extra>"))
+        fig_d2.add_annotation(text="<b>775</b><br>Trials",x=0.5,y=0.5,font=dict(size=13,color="#0F172A",family="Plus Jakarta Sans"),showarrow=False)
+        fig_d2.update_layout(**BASE_LAYOUT,height=240,showlegend=False,margin=dict(l=0,r=0,t=0,b=0))
+        st.plotly_chart(fig_d2,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('</div>',unsafe_allow_html=True)
 
     with c7:
-        st.markdown('<div class="chart-card"><div class="chart-title">Trial Status Breakdown</div><div class="chart-sub">Active vs completed vs terminated</div>', unsafe_allow_html=True)
-        fig_st = go.Figure()
-        for s,pv,lv,c in zip(
-            ["Completed","Recruiting","Active","Terminated","Withdrawn"],
-            [500,89,71,118,18],[506,109,85,53,13],
-            ["#22C55E","#1D4ED8","#F59E0B","#EF4444","#94A3B8"]):
-            fig_st.add_trace(go.Bar(name=s,x=["Pfizer","Eli Lilly"],y=[pv,lv],
-                marker_color=c,text=[pv,lv],textposition="inside",textfont=dict(size=9,color="white")))
-        fig_st.update_layout(**BASE_LAYOUT, height=240, barmode="stack",
-            margin=dict(l=0,r=70,t=0,b=0),
-            legend=dict(orientation="v",x=1.02,y=0.5,font=dict(size=8)),
-            xaxis=dict(showgrid=False,tickfont=dict(size=11)),
-            yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=9)))
-        st.plotly_chart(fig_st, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Trial Status Breakdown</div><div class="chart-sub">Active vs completed vs terminated</div>',unsafe_allow_html=True)
+        fig_st=go.Figure()
+        for s,pv,lv,c in zip(["Completed","Recruiting","Active","Terminated","Withdrawn"],[500,89,71,118,18],[506,109,85,53,13],["#22C55E","#1D4ED8","#F59E0B","#EF4444","#94A3B8"]):
+            fig_st.add_trace(go.Bar(name=s,x=["Pfizer","Eli Lilly"],y=[pv,lv],marker_color=c,text=[pv,lv],textposition="inside",textfont=dict(size=9,color="white")))
+        fig_st.update_layout(**BASE_LAYOUT,height=240,barmode="stack",margin=dict(l=0,r=70,t=0,b=0),legend=dict(orientation="v",x=1.02,y=0.5,font=dict(size=8)),xaxis=dict(showgrid=False,tickfont=dict(size=11)),yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=9)))
+        st.plotly_chart(fig_st,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('</div>',unsafe_allow_html=True)
 
-    st.markdown('<div class="chart-card"><div class="chart-title">Therapeutic Area Heatmap</div><div class="chart-sub">Trial count per disease area · Darker = more trials · Reveals strategic focus</div>', unsafe_allow_html=True)
-    areas = ["Oncology","Diabetes","Immunology","Obesity/Metabolic","Neurology","Infectious Disease","Cardiovascular"]
-    fig_h = go.Figure(go.Heatmap(
-        z=[[151,13,67,17,25,91,4],[83,130,94,73,42,8,6]],
-        x=areas, y=["Pfizer","Eli Lilly"],
-        text=[[str(v) for v in [151,13,67,17,25,91,4]],[str(v) for v in [83,130,94,73,42,8,6]]],
-        texttemplate="%{text}", textfont=dict(size=13,family="JetBrains Mono"),
-        colorscale=[[0,"#F8FAFC"],[0.2,"#DBEAFE"],[0.5,"#60A5FA"],[0.8,"#1D4ED8"],[1,"#1E3A8A"]],
-        showscale=True, colorbar=dict(thickness=10,tickfont=dict(size=9)),
-        hovertemplate="<b>%{y}</b><br>%{x}: <b>%{z} trials</b><extra></extra>"))
-    fig_h.update_layout(**BASE_LAYOUT, height=180,
-        margin=dict(l=0,r=0,t=0,b=0),
-        xaxis=dict(showgrid=False,tickfont=dict(size=11)),
-        yaxis=dict(showgrid=False,tickfont=dict(size=12)))
-    st.plotly_chart(fig_h, use_container_width=True, config=PLOTLY_CFG)
-    st.markdown('<div class="insight">💡 <strong>Pfizer dominates Oncology (151) & Infectious Disease (91)</strong>. <strong>Eli Lilly leads Diabetes (130), Obesity (73) & Immunology (94)</strong> — aligned with Mounjaro, Zepbound & Taltz.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="chart-card"><div class="chart-title">Therapeutic Area Heatmap</div><div class="chart-sub">Trial count per disease area · Darker = more trials · Reveals strategic focus</div>',unsafe_allow_html=True)
+    areas=["Oncology","Diabetes","Immunology","Obesity/Metabolic","Neurology","Infectious Disease","Cardiovascular"]
+    fig_h=go.Figure(go.Heatmap(z=[[151,13,67,17,25,91,4],[83,130,94,73,42,8,6]],x=areas,y=["Pfizer","Eli Lilly"],text=[[str(v) for v in [151,13,67,17,25,91,4]],[str(v) for v in [83,130,94,73,42,8,6]]],texttemplate="%{text}",textfont=dict(size=13,family="JetBrains Mono"),colorscale=[[0,"#F8FAFC"],[0.2,"#DBEAFE"],[0.5,"#60A5FA"],[0.8,"#1D4ED8"],[1,"#1E3A8A"]],showscale=True,colorbar=dict(thickness=10,tickfont=dict(size=9)),hovertemplate="<b>%{y}</b><br>%{x}: <b>%{z} trials</b><extra></extra>"))
+    fig_h.update_layout(**BASE_LAYOUT,height=180,margin=dict(l=0,r=0,t=0,b=0),xaxis=dict(showgrid=False,tickfont=dict(size=11)),yaxis=dict(showgrid=False,tickfont=dict(size=12)))
+    st.plotly_chart(fig_h,use_container_width=True,config=PLOTLY_CFG)
+    st.markdown('<div class="insight">💡 <strong>Pfizer dominates Oncology (151) & Infectious Disease (91)</strong>. <strong>Eli Lilly leads Diabetes (130), Obesity (73) & Immunology (94)</strong> — aligned with Mounjaro, Zepbound & Taltz.</div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════
 # CHATBOT
@@ -507,7 +537,7 @@ elif st.session_state.view == "chatbot":
             <span class="hero-chip">📄 Annual Reports</span>
             <span class="hero-chip">🧬 Clinical Trials</span>
             <span class="hero-chip">🤖 Claude Sonnet 4.6</span>
-            <span class="hero-chip">⚡ Pinecone RAG</span>
+            <span class="hero-chip">⚡ Multi-Query RAG</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -540,9 +570,9 @@ elif st.session_state.view == "chatbot":
                             css = "sp-p" if src.get("company")=="pfizer" else "sp-l"
                             co  = "Pfizer" if src.get("company")=="pfizer" else "Eli Lilly"
                             ico = "📄" if src.get("doc_type")=="annual" else "🧬"
-                            st.markdown(f'<span class="source-pill {css}">{ico} {co} · {src.get("doc_type","").title()} · {src.get("year","")} · p.{src.get("page","")}</span>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="source-pill {css}">{ico} {co} · {src.get("doc_type","").title()} · {src.get("year","")} · p.{src.get("page","")}</span>',unsafe_allow_html=True)
                 if "tokens" in msg:
-                    st.markdown(f'<div class="tok-info">🔢 {msg["tokens"]:,} tokens &nbsp;·&nbsp; 💰 ${msg["cost"]:.5f}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="tok-info">🔢 {msg["tokens"]:,} tokens &nbsp;·&nbsp; 💰 ${msg["cost"]:.5f}</div>',unsafe_allow_html=True)
 
     def run_query(question):
         st.session_state.messages.append({"role":"user","content":question})
@@ -558,12 +588,9 @@ elif st.session_state.view == "chatbot":
                         css = "sp-p" if src.get("company")=="pfizer" else "sp-l"
                         co  = "Pfizer" if src.get("company")=="pfizer" else "Eli Lilly"
                         ico = "📄" if src.get("doc_type")=="annual" else "🧬"
-                        st.markdown(f'<span class="source-pill {css}">{ico} {co} · {src.get("doc_type","").title()} · {src.get("year","")} · p.{src.get("page","")}</span>', unsafe_allow_html=True)
-            st.markdown(f'<div class="tok-info">🔢 {tokens:,} tokens &nbsp;·&nbsp; 💰 ${cost:.5f}</div>', unsafe_allow_html=True)
-        st.session_state.messages.append({
-            "role":"assistant","content":answer,
-            "sources":sources,"tokens":tokens,"cost":cost
-        })
+                        st.markdown(f'<span class="source-pill {css}">{ico} {co} · {src.get("doc_type","").title()} · {src.get("year","")} · p.{src.get("page","")}</span>',unsafe_allow_html=True)
+            st.markdown(f'<div class="tok-info">🔢 {tokens:,} tokens &nbsp;·&nbsp; 💰 ${cost:.5f}</div>',unsafe_allow_html=True)
+        st.session_state.messages.append({"role":"assistant","content":answer,"sources":sources,"tokens":tokens,"cost":cost})
         st.session_state.total_tokens += tokens
         st.session_state.total_cost   += cost
         st.session_state.query_count  += 1
@@ -590,88 +617,41 @@ elif st.session_state.view == "chatbot":
 # ════════════════════════════════════════════════
 elif st.session_state.view == "viz":
 
-    st.markdown('<div class="sec-hdr" style="margin-top:20px;"><div class="sec-title">Advanced Analytics & Deep Dive</div><div class="sec-badge">Extended Visualizations · Real Data</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-hdr" style="margin-top:20px;"><div class="sec-title">Advanced Analytics & Deep Dive</div><div class="sec-badge">Extended Visualizations · Real Data</div></div>',unsafe_allow_html=True)
 
-    st.markdown('<div class="chart-card"><div class="chart-title">Pfizer Revenue Journey — The COVID Cliff Story</div><div class="chart-sub">USD millions · FY2021 → FY2024</div>', unsafe_allow_html=True)
-    fig_wf = go.Figure(go.Waterfall(
-        x        = ["FY2021","FY2022","FY2023 Drop","FY2023","FY2024 Growth","FY2024"],
-        y        = [81288,18042,-41876,0,5129,0],
-        measure  = ["absolute","relative","relative","absolute","relative","absolute"],
-        text     = ["$81.3B","+$19.0B","-$41.8B","$58.5B","+$5.1B","$63.6B"],
-        textposition = "outside",
-        textfont = dict(size=11,family="JetBrains Mono"),
-        increasing = dict(marker=dict(color="#22C55E")),
-        decreasing = dict(marker=dict(color="#EF4444")),
-        totals   = dict(marker=dict(color=PFE_COLOR)),
-        connector = dict(line=dict(color="#E2E8F0",width=1,dash="dot"))))
-    fig_wf.update_layout(**BASE_LAYOUT, height=300,
-        margin=dict(l=0,r=0,t=30,b=0),
-        xaxis=dict(showgrid=False,tickfont=dict(size=11),type="category"),
-        yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
-    st.plotly_chart(fig_wf, use_container_width=True, config=PLOTLY_CFG)
-    st.markdown('<div class="insight">💡 Pfizer surged from <strong>$81B (FY2021) to $100B (FY2022)</strong> on COVID vaccine & Paxlovid — crashed to <strong>$58.5B in FY2023</strong>. Recovering to <strong>$63.6B in FY2024</strong>.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="chart-card"><div class="chart-title">Pfizer Revenue Journey — The COVID Cliff Story</div><div class="chart-sub">USD millions · FY2021 → FY2024</div>',unsafe_allow_html=True)
+    fig_wf=go.Figure(go.Waterfall(x=["FY2021","FY2022","FY2023 Drop","FY2023","FY2024 Growth","FY2024"],y=[81288,18042,-41876,0,5129,0],measure=["absolute","relative","relative","absolute","relative","absolute"],text=["$81.3B","+$19.0B","-$41.8B","$58.5B","+$5.1B","$63.6B"],textposition="outside",textfont=dict(size=11,family="JetBrains Mono"),increasing=dict(marker=dict(color="#22C55E")),decreasing=dict(marker=dict(color="#EF4444")),totals=dict(marker=dict(color=PFE_COLOR)),connector=dict(line=dict(color="#E2E8F0",width=1,dash="dot"))))
+    fig_wf.update_layout(**BASE_LAYOUT,height=300,margin=dict(l=0,r=0,t=30,b=0),xaxis=dict(showgrid=False,tickfont=dict(size=11),type="category"),yaxis=dict(showgrid=True,gridcolor="#F1F5F9",tickprefix="$",ticksuffix="M",tickfont=dict(size=10)))
+    st.plotly_chart(fig_wf,use_container_width=True,config=PLOTLY_CFG)
+    st.markdown('<div class="insight">💡 Pfizer surged from <strong>$81B (FY2021) to $100B (FY2022)</strong> on COVID vaccine & Paxlovid — crashed to <strong>$58.5B in FY2023</strong>. Recovering to <strong>$63.6B in FY2024</strong>.</div></div>',unsafe_allow_html=True)
 
-    cv1,cv2 = st.columns(2)
-
+    cv1,cv2=st.columns(2)
     with cv1:
-        st.markdown('<div class="chart-card"><div class="chart-title">R&D Efficiency — Bubble Analysis</div><div class="chart-sub">R&D spend vs Net Income · Bubble size = Revenue</div>', unsafe_allow_html=True)
-        fig_sc = go.Figure()
-        for co,rd,ni,rev,clr in zip(
-            ["Pfizer FY23","Pfizer FY24","Eli Lilly FY23","Eli Lilly FY25"],
-            [10679,10953,9234,12155],[2233,8030,5240,10591],
-            [58496,63625,34124,45042],[PFE_COLOR,PFE_COLOR,LLY_COLOR,LLY_COLOR]):
-            fig_sc.add_trace(go.Scatter(x=[rd],y=[ni],mode="markers+text",
-                marker=dict(size=rev/1200,color=clr,opacity=0.75,line=dict(color="white",width=2)),
-                text=[co],textposition="top center",textfont=dict(size=10,family="Plus Jakarta Sans"),
-                showlegend=False,
-                hovertemplate=f"<b>{co}</b><br>R&D: ${rd:,}M<br>Net: ${ni:,}M<extra></extra>"))
-        fig_sc.update_layout(**BASE_LAYOUT, height=280,
-            margin=dict(l=0,r=0,t=30,b=0),
-            xaxis=dict(title="R&D Spend ($M)",showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=10)),
-            yaxis=dict(title="Net Income ($M)",showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=10)))
-        st.plotly_chart(fig_sc, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 <strong>Eli Lilly converts R&D to profit far more efficiently</strong> — similar R&D spend but 2.3x more net income.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">R&D Efficiency — Bubble Analysis</div><div class="chart-sub">R&D spend vs Net Income · Bubble size = Revenue</div>',unsafe_allow_html=True)
+        fig_sc=go.Figure()
+        for co,rd,ni,rev,clr in zip(["Pfizer FY23","Pfizer FY24","Eli Lilly FY23","Eli Lilly FY25"],[10679,10953,9234,12155],[2233,8030,5240,10591],[58496,63625,34124,45042],[PFE_COLOR,PFE_COLOR,LLY_COLOR,LLY_COLOR]):
+            fig_sc.add_trace(go.Scatter(x=[rd],y=[ni],mode="markers+text",marker=dict(size=rev/1200,color=clr,opacity=0.75,line=dict(color="white",width=2)),text=[co],textposition="top center",textfont=dict(size=10,family="Plus Jakarta Sans"),showlegend=False,hovertemplate=f"<b>{co}</b><br>R&D: ${rd:,}M<br>Net: ${ni:,}M<extra></extra>"))
+        fig_sc.update_layout(**BASE_LAYOUT,height=280,margin=dict(l=0,r=0,t=30,b=0),xaxis=dict(title="R&D Spend ($M)",showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=10)),yaxis=dict(title="Net Income ($M)",showgrid=True,gridcolor="#F1F5F9",tickfont=dict(size=10)))
+        st.plotly_chart(fig_sc,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 <strong>Eli Lilly converts R&D to profit far more efficiently</strong> — similar spend but 2.3x more net income.</div></div>',unsafe_allow_html=True)
 
     with cv2:
-        st.markdown('<div class="chart-card"><div class="chart-title">Phase 3 Pipeline — Butterfly Chart</div><div class="chart-sub">Head-to-head Phase 3 comparison by therapeutic area</div>', unsafe_allow_html=True)
-        areas_p3 = ["Oncology","Immunology","Diabetes","Obesity","Neurology","Infectious"]
-        pfe_p3   = [52,18,4,6,9,32]
-        lly_p3   = [28,35,48,31,18,2]
-        fig_p3   = go.Figure()
-        fig_p3.add_trace(go.Bar(name="Pfizer",y=areas_p3,x=pfe_p3,orientation="h",
-            marker_color=PFE_COLOR,opacity=0.85,text=pfe_p3,textposition="outside",
-            textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
-        fig_p3.add_trace(go.Bar(name="Eli Lilly",y=areas_p3,x=[-v for v in lly_p3],orientation="h",
-            marker_color=LLY_COLOR,opacity=0.85,text=lly_p3,textposition="outside",
-            textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
-        fig_p3.update_layout(**BASE_LAYOUT, height=280, barmode="relative",
-            margin=dict(l=0,r=0,t=30,b=0),
-            legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),
-            xaxis=dict(showgrid=False,tickvals=[-60,-40,-20,0,20,40,60],
-                ticktext=["60","40","20","0","20","40","60"],tickfont=dict(size=10),
-                title="← Eli Lilly  |  Pfizer →",title_font=dict(size=10,color="#64748B")),
-            yaxis=dict(showgrid=False,tickfont=dict(size=10)))
-        st.plotly_chart(fig_p3, use_container_width=True, config=PLOTLY_CFG)
-        st.markdown('<div class="insight">💡 <strong>Eli Lilly Phase 3 dominates Diabetes, Obesity & Immunology</strong>. Pfizer leads in Oncology & Infectious Disease.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="chart-card"><div class="chart-title">Phase 3 Pipeline — Butterfly Chart</div><div class="chart-sub">Head-to-head Phase 3 comparison by therapeutic area</div>',unsafe_allow_html=True)
+        areas_p3=["Oncology","Immunology","Diabetes","Obesity","Neurology","Infectious"]
+        pfe_p3=[52,18,4,6,9,32]; lly_p3=[28,35,48,31,18,2]
+        fig_p3=go.Figure()
+        fig_p3.add_trace(go.Bar(name="Pfizer",y=areas_p3,x=pfe_p3,orientation="h",marker_color=PFE_COLOR,opacity=0.85,text=pfe_p3,textposition="outside",textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
+        fig_p3.add_trace(go.Bar(name="Eli Lilly",y=areas_p3,x=[-v for v in lly_p3],orientation="h",marker_color=LLY_COLOR,opacity=0.85,text=lly_p3,textposition="outside",textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
+        fig_p3.update_layout(**BASE_LAYOUT,height=280,barmode="relative",margin=dict(l=0,r=0,t=30,b=0),legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=11)),xaxis=dict(showgrid=False,tickvals=[-60,-40,-20,0,20,40,60],ticktext=["60","40","20","0","20","40","60"],tickfont=dict(size=10),title="← Eli Lilly  |  Pfizer →",title_font=dict(size=10,color="#64748B")),yaxis=dict(showgrid=False,tickfont=dict(size=10)))
+        st.plotly_chart(fig_p3,use_container_width=True,config=PLOTLY_CFG)
+        st.markdown('<div class="insight">💡 <strong>Eli Lilly Phase 3 dominates Diabetes, Obesity & Immunology</strong>. Pfizer leads in Oncology & Infectious Disease.</div></div>',unsafe_allow_html=True)
 
-    st.markdown('<div class="chart-card"><div class="chart-title">Profitability Trend Analysis</div><div class="chart-sub">Gross margin % and Net income margin % · Trajectory comparison</div>', unsafe_allow_html=True)
-    fig_m = go.Figure()
-    fig_m.add_trace(go.Scatter(x=["FY2023","FY2024"],y=[70.0,70.8],mode="lines+markers+text",
-        name="Pfizer Gross Margin",line=dict(color=PFE_COLOR,width=2.5),marker=dict(size=8,color=PFE_COLOR),
-        text=["70.0%","70.8%"],textposition="top center",textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
-    fig_m.add_trace(go.Scatter(x=["FY2023","FY2024"],y=[3.8,12.6],mode="lines+markers+text",
-        name="Pfizer Net Margin",line=dict(color=PFE_COLOR,width=2,dash="dot"),marker=dict(size=8,color=PFE_COLOR),
-        text=["3.8%","12.6%"],textposition="bottom center",textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
-    fig_m.add_trace(go.Scatter(x=["FY2023","FY2025"],y=[83.5,86.4],mode="lines+markers+text",
-        name="Eli Lilly Gross Margin",line=dict(color=LLY_COLOR,width=2.5),marker=dict(size=8,color=LLY_COLOR),
-        text=["83.5%","86.4%"],textposition="top center",textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
-    fig_m.add_trace(go.Scatter(x=["FY2023","FY2025"],y=[15.4,23.5],mode="lines+markers+text",
-        name="Eli Lilly Net Margin",line=dict(color=LLY_COLOR,width=2,dash="dot"),marker=dict(size=8,color=LLY_COLOR),
-        text=["15.4%","23.5%"],textposition="bottom center",textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
-    fig_m.update_layout(**BASE_LAYOUT, height=280,
-        margin=dict(l=0,r=0,t=30,b=0),
-        legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=10)),
-        xaxis=dict(showgrid=False,tickfont=dict(size=11),type="category"),
-        yaxis=dict(showgrid=True,gridcolor="#F1F5F9",ticksuffix="%",tickfont=dict(size=10),range=[0,100]))
-    st.plotly_chart(fig_m, use_container_width=True, config=PLOTLY_CFG)
-    st.markdown('<div class="insight">💡 <strong>Eli Lilly gross margin (83.5-86.4%) far outperforms Pfizer (70%)</strong>. Eli Lilly net margin improving 15.4%→23.5%. Pfizer recovering strongly 3.8%→12.6%.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="chart-card"><div class="chart-title">Profitability Trend Analysis</div><div class="chart-sub">Gross margin % and Net income margin % · Trajectory comparison</div>',unsafe_allow_html=True)
+    fig_m=go.Figure()
+    fig_m.add_trace(go.Scatter(x=["FY2023","FY2024"],y=[70.0,70.8],mode="lines+markers+text",name="Pfizer Gross Margin",line=dict(color=PFE_COLOR,width=2.5),marker=dict(size=8,color=PFE_COLOR),text=["70.0%","70.8%"],textposition="top center",textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
+    fig_m.add_trace(go.Scatter(x=["FY2023","FY2024"],y=[3.8,12.6],mode="lines+markers+text",name="Pfizer Net Margin",line=dict(color=PFE_COLOR,width=2,dash="dot"),marker=dict(size=8,color=PFE_COLOR),text=["3.8%","12.6%"],textposition="bottom center",textfont=dict(size=10,family="JetBrains Mono",color=PFE_COLOR)))
+    fig_m.add_trace(go.Scatter(x=["FY2023","FY2025"],y=[83.5,86.4],mode="lines+markers+text",name="Eli Lilly Gross Margin",line=dict(color=LLY_COLOR,width=2.5),marker=dict(size=8,color=LLY_COLOR),text=["83.5%","86.4%"],textposition="top center",textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
+    fig_m.add_trace(go.Scatter(x=["FY2023","FY2025"],y=[15.4,23.5],mode="lines+markers+text",name="Eli Lilly Net Margin",line=dict(color=LLY_COLOR,width=2,dash="dot"),marker=dict(size=8,color=LLY_COLOR),text=["15.4%","23.5%"],textposition="bottom center",textfont=dict(size=10,family="JetBrains Mono",color=LLY_COLOR)))
+    fig_m.update_layout(**BASE_LAYOUT,height=280,margin=dict(l=0,r=0,t=30,b=0),legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,font=dict(size=10)),xaxis=dict(showgrid=False,tickfont=dict(size=11),type="category"),yaxis=dict(showgrid=True,gridcolor="#F1F5F9",ticksuffix="%",tickfont=dict(size=10),range=[0,100]))
+    st.plotly_chart(fig_m,use_container_width=True,config=PLOTLY_CFG)
+    st.markdown('<div class="insight">💡 <strong>Eli Lilly gross margin (83.5-86.4%) far outperforms Pfizer (70%)</strong>. Eli Lilly net margin improving 15.4%→23.5%. Pfizer recovering strongly 3.8%→12.6%.</div></div>',unsafe_allow_html=True)
